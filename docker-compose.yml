@@ -1,0 +1,22 @@
+services:
+  rclone-bot:
+    build: .
+    container_name: rclone-tg-bot
+    restart: unless-stopped
+    env_file:
+      - config.env
+    ports:
+      - "8080:8080"
+    volumes:
+      # Provide rclone.conf directly instead of RCLONE_CONF/RCLONE_CONF_URL
+      - ./rclone.conf:/root/.config/rclone/rclone.conf:ro
+      # Persist stats and the pyrogram session across restarts
+      - bot-data:/app
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  bot-data:
