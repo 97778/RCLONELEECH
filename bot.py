@@ -774,7 +774,7 @@ def _render_board(total_files: int, concurrent: int, progress_map: dict) -> str:
     else:
         body = "_No active jobs_"
 
-    footer_lines = [f"├ Total:  ✅ {done}  ❌ {failed}"]
+    footer_lines = [f"├ Total:  ✅ {done} | ❌ {failed}"]
     if psutil is not None:
         try:
             cpu = psutil.cpu_percent(interval=None)
@@ -785,7 +785,7 @@ def _render_board(total_files: int, concurrent: int, progress_map: dict) -> str:
 
     try:
         du = shutil.disk_usage(DOWNLOAD_DIR)
-        footer_lines.append(f"├ Disk: {fmt_size(du.free)} free | {fmt_size(du.total)}")
+        footer_lines.append(f"├ FREE: {fmt_size(du.free)} | {fmt_size(du.total)}")
     except Exception as e:
         log.debug(f"_render_board disk failed: {e}")
 
@@ -910,7 +910,6 @@ async def upload_part_with_progress(
             if eta_str and eta_str != "—":
                 lines.append(f"├ ETA: {eta_str}")
             lines.append(f"├ Elapsed: {fmt_eta(elapsed)}")
-            lines.append(f"├ File: {idx}/{total_files}")
             lines[-1] = lines[-1].replace("├", "└", 1)
             progress_map[idx] = "\n".join(lines)
         else:
@@ -1334,7 +1333,7 @@ async def cmd_start(_, msg: Message):
     await msg.reply(
         "**🤖 Rclone → Telegram Bot**\n\n"
         "**Commands:**\n"
-        "`/dl Dropbox32:path/` — download & upload all files\n"
+        "`/dl Dropbox:path/` — download & upload all files\n"
         "`/retry` — re-run files that failed in the last job\n"
         "`/queue` — show current job progress\n"
         "`/setdelete on|off` — auto-delete from remote after upload\n"
