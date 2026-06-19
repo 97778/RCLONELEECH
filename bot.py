@@ -1206,11 +1206,18 @@ async def _run_job(status_msg: Message, files: list[str], remote_path: str,
             _rp = remote_path.rstrip("/")
             if ":" in _rp:
                 _rpx, _rpp = _rp.split(":", 1)
-                _rp = _rpx + ":" + _rpp.lstrip("/")
-            full_remote = (
-                _rp if (total == 1 and not _rp.endswith("/"))
-                else f"{_rp}/{fname}"
-            )
+                _rpp = _rpp.lstrip("/")
+                # If path part is empty (e.g. "Dropbox3:"), join without slash
+                if _rpp:
+                    _rp = _rpx + ":" + _rpp
+                else:
+                    _rp = _rpx + ":"
+            if total == 1 and not remote_path.endswith("/"):
+                full_remote = _rp
+            elif _rp.endswith(":"):
+                full_remote = _rp + fname
+            else:
+                full_remote = _rp + "/" + fname
             log.info(f"[job] full_remote={full_remote!r}")
             tasks.append(asyncio.create_task(_guarded(fname, full_remote, idx)))
 
