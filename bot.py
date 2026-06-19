@@ -1041,7 +1041,12 @@ async def process_one_file(
             for part_idx, part_path in enumerate(parts, 1):
                 part_size = os.path.getsize(part_path)
                 fname_only = fname.split("/")[-1]
+                # Strip remote prefix e.g. "Dropbox3:filename.mp4" → "filename.mp4"
+                if ":" in fname_only:
+                    fname_only = fname_only.split(":", 1)[-1]
                 part_filename = os.path.basename(part_path)
+                if ":" in part_filename:
+                    part_filename = part_filename.split(":", 1)[-1]
                 if total_parts > 1:
                     caption = (
                         f"`{part_filename}`\n\n"
