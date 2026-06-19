@@ -1057,6 +1057,14 @@ async def process_one_file(
             parts = await loop.run_in_executor(
                 None, split_file, local_path, split_dir, user_id
             )
+            if local_path not in parts:
+                # Split actually produced separate part files — the original
+                # is no longer needed, so free it now instead of holding
+                # original + parts on disk simultaneously (was ~2x file size).
+                try:
+                    os.remove(local_path)
+                except OSError as e:
+                    log.warning(f"[{idx}/{total}] Could not remove original after split: {e}")
         else:
             parts = [local_path]
 
@@ -1100,6 +1108,16 @@ async def process_one_file(
                 )
                 if sent:
                     prev_msg_id = sent.id
+                    # Free this part's disk space immediately rather than
+                    # holding every part until the whole file finishes
+                    # uploading — keeps peak usage to ~1 part at a time.
+                    try:
+                        os.remove(part_path)
+                    except OSError as e:
+                        log.warning(
+                            f"[{idx}/{total}] Could not remove part after upload: "
+                            f"{part_path} — {e}"
+                        )
                 else:
                     all_parts_sent = False
                     log.error(
