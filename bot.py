@@ -259,7 +259,9 @@ class _HealthHandler(BaseHTTPRequestHandler):
 
 def _run_health():
     try:
-        HTTPServer(("0.0.0.0", HEALTH_PORT), _HealthHandler).serve_forever()
+        server = HTTPServer(("0.0.0.0", HEALTH_PORT), _HealthHandler)
+        server.allow_reuse_address = True
+        server.serve_forever()
     except Exception as e:
         log.error(f"Health server failed on port {HEALTH_PORT}: {e}")
 
@@ -762,11 +764,14 @@ def _render_board(total_files: int, concurrent: int, progress_map: dict) -> str:
     header = f"📦 **{total_files} file(s)** · ⚡ **{concurrent} concurrent**\n"
     separator = "━" * 24
 
-    done = sum(1 for v in progress_map.values() if v.startswith("✅"))
+    # FIX: Strictly match final upload completion states so temporary download markers don't trigger them
+    done = sum(1 for v in progress_map.values() if v.startswith(("✅ ", "✅🗑", "✅⚠️")))
     failed = sum(1 for v in progress_map.values() if v.startswith("❌"))
+
+    # FIX: Keep files that are currently processing (downloaded, splitting, etc.) in the active display
     active_entries = {
         k: v for k, v in progress_map.items()
-        if not (v.startswith("✅") or v.startswith("❌"))
+        if not (v.startswith(("✅ ", "✅🗑", "✅⚠️")) or v.startswith("❌"))
     }
 
     if active_entries:
@@ -1029,8 +1034,9 @@ async def process_one_file(
         dl_elapsed = time.monotonic() - dl_start
         dl_speed = fmt_size(int(file_size / dl_elapsed)) + "/s" if dl_elapsed > 0 else ""
 
+        # FIX: Changed prefix from '✅⬇️' to '📥 Downloaded ✅' so it isn't parsed as a completed upload
         progress_map[idx] = (
-            f"✅⬇️ `[{idx}/{total}]` `{fname_display}`\n"
+            f"📥 Downloaded ✅ `[{idx}/{total}]` `{fname_display}`\n"
             f"└ [{'●' * 12}] » 100%  {fmt_size(file_size)}"
             + (f"  ⚡ avg {dl_speed}" if dl_speed else "")
         )
