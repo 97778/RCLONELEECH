@@ -56,8 +56,11 @@ def _load_env_file(path: str = "config.env") -> None:
 _load_env_file("config.env")
 
 # ── rclone.conf loader ─────────────────────────────────────────
+RCLONE_CONF_PATH = Path("/root/.config/rclone/rclone.conf")
+
+
 def _write_rclone_conf() -> None:
-    _target = Path("/root/.config/rclone/rclone.conf")
+    _target = RCLONE_CONF_PATH
 
     _url = os.environ.get("RCLONE_CONF_URL", "").strip()
     if _url:
@@ -167,6 +170,7 @@ BOT_START_TIME = time.time()
 active_sessions: set[int] = set()
 cancel_flags: dict[int, bool] = {}
 upload_mode: dict[int, str] = {}
+awaiting_rclone_conf: set[int] = set()  # users who ran /setrclone and now need to send the file
 delete_after_upload: bool = False
 last_failed: list[str] = []          # files that failed in the last job
 last_job_remote: str | None = None   # remote path of the last job (for /retry)
@@ -1342,6 +1346,7 @@ async def cmd_start(_, msg: Message):
         "**Commands:**\n"
         "`/dl Dropbox:path/` — download & upload all files\n"
         "`/retry` — re-run files that failed in the last job\n"
+        "`/setrclone` — upload a new rclone.conf (send file after running this)\n"
         "`/queue` — show current job progress\n"
         "`/setdelete on|off` — auto-delete from remote after upload\n"
         "`/concurrent 2` — set concurrent jobs (1–5)\n"
@@ -1435,6 +1440,10 @@ async def cmd_logs(_, msg: Message):
 @app.on_message(filters.command("cancel") & auth_filter)
 async def cmd_cancel(_, msg: Message):
     user_id = msg.from_user.id
+    if user_id in awaiting_rclone_conf:
+        awaiting_rclone_conf.discard(user_id)
+        await msg.reply("❌ rclone.conf upload cancelled.")
+        return
     if user_id not in active_sessions:
         await msg.reply("ℹ️ No active job to cancel.")
         return
@@ -1630,6 +1639,97 @@ async def cmd_retry(_, msg: Message):
     status_msg = await msg.reply(f"🔁 Retrying **{len(files)}** failed file(s)…")
     results = await _run_job(status_msg, files, remote_path, mode, user_id, do_delete)
     await _send_summary(status_msg, results)
+
+
+def _validate_rclone_conf_text(text: str) -> list[str]:
+    """
+    Quick sanity check that this looks like an rclone config file.
+    Returns the list of remote names found (e.g. ['Dropbox32', 'Gdrive']).
+    Raises ValueError if it doesn't look like a valid config.
+    """
+    remotes = re.findall(r"^\[([^\]]+)\]", text, re.MULTILINE)
+    if not remotes:
+        raise ValueError("No `[remote]` sections found — this doesn't look like an rclone.conf file.")
+    return remotes
+
+
+@app.on_message(filters.command("setrclone") & auth_filter)
+async def cmd_setrclone(_, msg: Message):
+    if active_sessions:
+        await msg.reply(
+            "⚠️ A job is currently running — swapping the rclone config mid-transfer "
+            "can break it. Use `/cancel` first, then `/setrclone` again."
+        )
+        return
+    user_id = msg.from_user.id
+    awaiting_rclone_conf.add(user_id)
+    await msg.reply(
+        "📤 **Send your `rclone.conf` file now** as a Telegram document "
+        "(just attach the file, no caption needed).\n\n"
+        "It will replace the bot's current rclone config. "
+        "The old one is kept as a backup.\n\n"
+        "Send /cancel to abort."
+    )
+
+
+@app.on_message(filters.document & auth_filter)
+async def on_rclone_conf_document(_, msg: Message):
+    user_id = msg.from_user.id
+    if user_id not in awaiting_rclone_conf:
+        return  # not expecting a file from this user right now — ignore silently
+
+    awaiting_rclone_conf.discard(user_id)
+
+    doc = msg.document
+    if doc.file_size and doc.file_size > 1024 * 1024:
+        await msg.reply("❌ That file is too large to be an rclone.conf. Aborted.")
+        return
+
+    status = await msg.reply("⬇️ Downloading config file…")
+    tmp_path = os.path.join(DOWNLOAD_DIR, f"rclone_upload_{user_id}_{int(time.time())}.conf")
+    try:
+        await msg.download(file_name=tmp_path)
+    except Exception as e:
+        await safe_edit(status, f"❌ Failed to download file:\n`{e}`")
+        return
+
+    try:
+        text = Path(tmp_path).read_text(encoding="utf-8", errors="strict")
+        remotes = _validate_rclone_conf_text(text)
+    except UnicodeDecodeError:
+        await safe_edit(status, "❌ File isn't valid UTF-8 text — doesn't look like an rclone.conf.")
+        Path(tmp_path).unlink(missing_ok=True)
+        return
+    except ValueError as e:
+        await safe_edit(status, f"❌ {e}")
+        Path(tmp_path).unlink(missing_ok=True)
+        return
+    except Exception as e:
+        await safe_edit(status, f"❌ Couldn't read file:\n`{e}`")
+        Path(tmp_path).unlink(missing_ok=True)
+        return
+
+    try:
+        RCLONE_CONF_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if RCLONE_CONF_PATH.exists():
+            backup_path = RCLONE_CONF_PATH.with_suffix(".conf.bak")
+            shutil.copy2(RCLONE_CONF_PATH, backup_path)
+        RCLONE_CONF_PATH.write_text(text, encoding="utf-8")
+        os.environ["RCLONE_CONFIG"] = str(RCLONE_CONF_PATH)
+        log.info(f"rclone.conf replaced via /setrclone by user {user_id} ({len(remotes)} remote(s))")
+    except Exception as e:
+        await safe_edit(status, f"❌ Failed to write rclone.conf:\n`{e}`")
+        Path(tmp_path).unlink(missing_ok=True)
+        return
+
+    Path(tmp_path).unlink(missing_ok=True)
+    remote_list = "\n".join(f"• `{r}`" for r in remotes)
+    await safe_edit(
+        status,
+        f"✅ **rclone.conf updated** — {len(remotes)} remote(s) found:\n{remote_list}\n\n"
+        "ℹ️ Previous config backed up to `rclone.conf.bak`.\n"
+        "No restart needed — new downloads will use this config."
+    )
 
 
 @app.on_callback_query(auth_filter)
