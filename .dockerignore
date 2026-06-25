@@ -3,7 +3,6 @@
 .gitlab-ci.yml
 README.md
 LICENSE
-config.env
 config.env.example
 docker-compose.yml
 __pycache__/
