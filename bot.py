@@ -172,8 +172,6 @@ cancel_flags: dict[int, bool] = {}
 upload_mode: dict[int, str] = {}
 awaiting_rclone_conf: set[int] = set()  # users who ran /setrclone and now need to send the file
 delete_after_upload: bool = False
-max_size_enabled: bool = False
-max_size_bytes: int = 2000 * 1024 * 1024  # cap used when the toggle is ON
 last_failed: list[str] = []          # files that failed in the last job
 last_job_remote: str | None = None   # remote path of the last job (for /retry)
 last_job_mode: str = "video"
@@ -464,71 +462,6 @@ def rclone_list(remote_path: str) -> list[str]:
         f.strip().lstrip("/") for f in r.stdout.splitlines()
         if f.strip() and f.strip().rsplit(".", 1)[-1].lower() in allowed
     ]
-
-
-def rclone_size_map(remote_path: str) -> dict[str, int]:
-    """Recursively list `remote_path` via `rclone lsjson -R` and return a
-    {relative_path: size_bytes} map, mirroring rclone_list's path semantics
-    (paths relative to remote_path, no leading slash). One subprocess call
-    for the whole job instead of one per file. Returns {} on any failure —
-    callers should treat a missing key as 'unknown size'."""
-    cmd = ["rclone", "lsjson", "-R", remote_path]
-    if RCLONE_FLAGS:
-        cmd += RCLONE_FLAGS.split()
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, env=_rclone_env())
-        if r.returncode != 0:
-            return {}
-        data = json.loads(r.stdout)
-        if not isinstance(data, list):
-            return {}
-        out = {}
-        for entry in data:
-            if entry.get("IsDir"):
-                continue
-            rel = (entry.get("Path") or "").lstrip("/")
-            size = entry.get("Size", -1)
-            if rel and isinstance(size, (int, float)) and size >= 0:
-                out[rel] = int(size)
-        return out
-    except Exception as e:
-        log.debug(f"rclone_size_map failed for {remote_path}: {e}")
-        return {}
-
-
-def rclone_size(remote_path: str) -> int:
-    """Fallback: look up the size of a single remote file by listing its
-    parent directory and matching the filename. Used when a precomputed
-    size map (rclone_size_map) doesn't have an entry — e.g. /retry, where
-    files come from a previous job and weren't re-listed.
-    Returns -1 if the size can't be determined (caller should treat that as
-    'unknown' and not block the download on it)."""
-    if ":" in remote_path:
-        remote_part, _, path_part = remote_path.partition(":")
-        remote_part += ":"
-    else:
-        remote_part, path_part = "", remote_path
-    parent = path_part.rsplit("/", 1)[0] if "/" in path_part else ""
-    target_name = path_part.rsplit("/", 1)[-1]
-    parent_remote = remote_part + parent if parent else remote_part
-
-    cmd = ["rclone", "lsjson", parent_remote]
-    if RCLONE_FLAGS:
-        cmd += RCLONE_FLAGS.split()
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, env=_rclone_env())
-        if r.returncode != 0:
-            return -1
-        data = json.loads(r.stdout)
-        if not isinstance(data, list):
-            return -1
-        for entry in data:
-            if entry.get("Name") == target_name and not entry.get("IsDir"):
-                size = entry.get("Size", -1)
-                return int(size) if isinstance(size, (int, float)) and size >= 0 else -1
-    except Exception as e:
-        log.debug(f"rclone_size failed for {remote_path}: {e}")
-    return -1
 
 
 def rclone_download(
@@ -838,12 +771,11 @@ def _render_board(total_files: int, concurrent: int, progress_map: dict) -> str:
     # FIX: Strictly match final upload completion states so temporary download markers don't trigger them
     done = sum(1 for v in progress_map.values() if v.startswith(("✅ ", "✅🗑", "✅⚠️")))
     failed = sum(1 for v in progress_map.values() if v.startswith("❌"))
-    skipped = sum(1 for v in progress_map.values() if v.startswith("⏭"))
 
     # FIX: Keep files that are currently processing (downloaded, splitting, etc.) in the active display
     active_entries = {
         k: v for k, v in progress_map.items()
-        if not (v.startswith(("✅ ", "✅🗑", "✅⚠️")) or v.startswith("❌") or v.startswith("⏭"))
+        if not (v.startswith(("✅ ", "✅🗑", "✅⚠️")) or v.startswith("❌"))
     }
 
     if active_entries:
@@ -851,7 +783,7 @@ def _render_board(total_files: int, concurrent: int, progress_map: dict) -> str:
     else:
         body = "_No active jobs_"
 
-    footer_lines = [f"├ Total:  ✅ {done} | ❌ {failed}" + (f" | ⏭ {skipped}" if skipped else "")]
+    footer_lines = [f"├ Total:  ✅ {done} | ❌ {failed}"]
     if psutil is not None:
         try:
             cpu = psutil.cpu_percent(interval=None)
@@ -1056,7 +988,6 @@ async def process_one_file(
     job_concurrent: int,
     do_delete: bool = False,
     board_state: "_BoardState | None" = None,
-    size_map: dict[str, int] | None = None,
 ) -> None:
 
     async with semaphore:
@@ -1088,28 +1019,6 @@ async def process_one_file(
         progress_map[idx] = f"⬇️ `[{idx}/{total}]` Connecting to `{fname_display}`…"
         await _push_board(status_msg, total, job_concurrent, progress_map,
                           board_state=board_state)
-
-        with state_lock:
-            size_cap_on = max_size_enabled
-            size_cap = max_size_bytes
-        if size_cap_on:
-            remote_size = size_map.get(fname, -1) if size_map else -1
-            if remote_size < 0:
-                # Cache miss (e.g. /retry, where files weren't freshly listed
-                # for this job) — fall back to a single per-file lookup.
-                remote_size = await loop.run_in_executor(None, rclone_size, full_remote)
-            if remote_size >= 0 and remote_size > size_cap:
-                log.info(
-                    f"[{idx}/{total}] Skipped (size cap): {fname} "
-                    f"({fmt_size(remote_size)} > {fmt_size(size_cap)})"
-                )
-                progress_map[idx] = (
-                    f"⏭ `[{idx}/{total}]` Skipped: `{fname_display}`\n"
-                    f"    `{fmt_size(remote_size)} exceeds {fmt_size(size_cap)} limit`"
-                )
-                results["skipped"].append(fname)
-                shutil.rmtree(file_dir, ignore_errors=True)
-                return
 
         try:
             local_path = await loop.run_in_executor(
@@ -1290,11 +1199,9 @@ async def process_one_file(
 # ── Mode selection keyboard ───────────────────────────────────────
 
 
-def mode_keyboard(remote_path: str, delete: bool = False, size_cap_on: bool = False) -> InlineKeyboardMarkup:
+def mode_keyboard(remote_path: str, delete: bool = False) -> InlineKeyboardMarkup:
     del_icon = "🗑 Delete ON  ✅" if delete else "🗑 Delete OFF  ❌"
     del_action = "deloff" if delete else "delon"
-    size_icon = "📏 Size Cap ON  ✅" if size_cap_on else "📏 Size Cap OFF  ❌"
-    size_action = "sizeoff" if size_cap_on else "sizeon"
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("🎬 Video", callback_data=f"mode:video:{remote_path}"),
@@ -1302,9 +1209,6 @@ def mode_keyboard(remote_path: str, delete: bool = False, size_cap_on: bool = Fa
         ],
         [
             InlineKeyboardButton(del_icon, callback_data=f"deltoggle:{del_action}:{remote_path}"),
-        ],
-        [
-            InlineKeyboardButton(size_icon, callback_data=f"sizetoggle:{size_action}:{remote_path}"),
         ]
     ])
 
@@ -1312,8 +1216,7 @@ def mode_keyboard(remote_path: str, delete: bool = False, size_cap_on: bool = Fa
 
 
 async def _run_job(status_msg: Message, files: list[str], remote_path: str,
-                   mode: str, user_id: int, do_delete: bool,
-                   size_map: dict[str, int] | None = None) -> dict:
+                   mode: str, user_id: int, do_delete: bool) -> dict:
     """Run a full upload job over `files`. Returns the results dict."""
     global last_failed, last_job_remote, last_job_mode
 
@@ -1340,7 +1243,7 @@ async def _run_job(status_msg: Message, files: list[str], remote_path: str,
 
     semaphore = asyncio.Semaphore(job_concurrent)
     progress_map: dict[int, str] = {}
-    results = {"success": 0, "failed": [], "deleted": 0, "delete_failed": [], "skipped": []}
+    results = {"success": 0, "failed": [], "deleted": 0, "delete_failed": []}
     board_state = _BoardState()
 
     try:
@@ -1356,7 +1259,6 @@ async def _run_job(status_msg: Message, files: list[str], remote_path: str,
                 job_concurrent,
                 do_delete=do_delete,
                 board_state=board_state,
-                size_map=size_map,
             )
 
         for idx, fname in enumerate(files, 1):
@@ -1403,7 +1305,6 @@ async def _send_summary(status_msg: Message, results: dict) -> None:
     total = results["total"]
     success = results["success"]
     failed = results["failed"]
-    skipped = results.get("skipped", [])
     deleted = results["deleted"]
     delete_failed = results["delete_failed"]
     mode_icon = results["mode_icon"]
@@ -1422,11 +1323,6 @@ async def _send_summary(status_msg: Message, results: dict) -> None:
     )
     if do_delete:
         summary += f"\n🗑 **Deleted from remote:** {deleted}/{success}"
-    if skipped:
-        skip_list = "\n".join(f"• `{f}`" for f in skipped[:10])
-        if len(skipped) > 10:
-            skip_list += f"\n…and {len(skipped) - 10} more"
-        summary += f"\n\n⏭ **Skipped — over size limit ({len(skipped)}):**\n{skip_list}"
     if failed:
         fail_list = "\n".join(f"• `{f}`" for f in failed[:10])
         if len(failed) > 10:
@@ -1453,7 +1349,6 @@ async def cmd_start(_, msg: Message):
         "`/setrclone` — upload a new rclone.conf (send file after running this)\n"
         "`/queue` — show current job progress\n"
         "`/setdelete on|off` — auto-delete from remote after upload\n"
-        "`/setmaxsize on|off|2000` — limit downloads to N MB (default 2000)\n"
         "`/concurrent 2` — set concurrent jobs (1–5)\n"
         "`/setbwlimit 8M|off` — limit rclone download bandwidth\n"
         "`/status` — bot stats & health\n"
@@ -1467,7 +1362,6 @@ async def cmd_start(_, msg: Message):
         "• 🎬 Video or 📄 Document mode per job\n"
         "• Auto thumbnail for videos (ffmpeg)\n"
         "• Auto-split files > 1.99 GB\n"
-        "• 📏 Optional max download size cap (skips oversized files)\n"
         "• 🗑 Optional auto-delete from remote"
     )
 
@@ -1479,8 +1373,6 @@ async def cmd_status(_, msg: Message):
     with state_lock:
         del_on = delete_after_upload
         bw = BW_LIMIT or "off"
-        size_on = max_size_enabled
-        cap_mb = max_size_bytes // (1024 * 1024)
     icon = "🟡" if active_sessions else "🟢"
     cur = snap["current_files"]
     text = (
@@ -1501,8 +1393,6 @@ async def cmd_status(_, msg: Message):
         text += f"⚠️ **Last error:** `{snap['last_error'][:100]}`\n"
     del_status = "ON 🟢" if del_on else "OFF 🔴"
     text += f"🗑 **Auto-delete:** `{del_status}`\n"
-    size_status = f"ON 🟢 ({cap_mb} MB)" if size_on else "OFF 🔴"
-    text += f"📏 **Size cap:** `{size_status}`\n"
     fw_count = snap["floodwait_count"]
     if fw_count > 0:
         fw_secs = snap["floodwait_last_secs"]
@@ -1631,46 +1521,6 @@ async def cmd_setdelete(_, msg: Message):
         await msg.reply("❌ Usage: `/setdelete on` or `/setdelete off`")
 
 
-@app.on_message(filters.command("setmaxsize") & auth_filter)
-async def cmd_setmaxsize(_, msg: Message):
-    global max_size_enabled, max_size_bytes
-    if len(msg.command) < 2:
-        with state_lock:
-            state = "ON 🟢" if max_size_enabled else "OFF 🔴"
-            cap_mb = max_size_bytes // (1024 * 1024)
-        await msg.reply(
-            f"📏 **Max file size limit is currently: {state}** (`{cap_mb} MB`)\n\n"
-            "Usage:\n"
-            "`/setmaxsize on` — enable the limit (uses last/default value)\n"
-            "`/setmaxsize off` — disable the limit (download any size)\n"
-            "`/setmaxsize 2000` — set limit to 2000 MB and enable it\n\n"
-            "Files larger than the limit are skipped before downloading."
-        )
-        return
-    arg = msg.command[1].strip().lower()
-    if arg == "on":
-        with state_lock:
-            max_size_enabled = True
-            cap_mb = max_size_bytes // (1024 * 1024)
-        await msg.reply(f"📏 **Max file size limit: ON 🟢** (`{cap_mb} MB`)\nLarger files will be skipped.")
-    elif arg == "off":
-        with state_lock:
-            max_size_enabled = False
-        await msg.reply("📏 **Max file size limit: OFF 🔴**\nFiles of any size will be downloaded.")
-    else:
-        try:
-            mb = int(arg)
-            if mb <= 0:
-                raise ValueError
-        except ValueError:
-            await msg.reply("❌ Usage: `/setmaxsize on`, `/setmaxsize off`, or `/setmaxsize 2000` (MB).")
-            return
-        with state_lock:
-            max_size_bytes = mb * 1024 * 1024
-            max_size_enabled = True
-        await msg.reply(f"📏 **Max file size limit: ON 🟢** (`{mb} MB`)\nLarger files will be skipped.")
-
-
 @app.on_message(filters.command("concurrent") & auth_filter)
 async def cmd_concurrent(_, msg: Message):
     global CONCURRENT_JOBS
@@ -1765,14 +1615,10 @@ async def cmd_dl(_, msg: Message):
     remote_path = msg.command[1].strip()
     with state_lock:
         del_on = delete_after_upload
-        size_on = max_size_enabled
-        cap_mb = max_size_bytes // (1024 * 1024)
-    size_line = f"📏 Size cap: {'ON 🟢 (' + str(cap_mb) + ' MB)' if size_on else 'OFF 🔴'}"
     await msg.reply(
         f"📂 **Choose upload mode for:**\n`{remote_path}`\n"
-        f"🗑 Auto-delete: {'ON 🟢' if del_on else 'OFF 🔴'}\n"
-        f"{size_line}",
-        reply_markup=mode_keyboard(remote_path, del_on, size_on)
+        f"🗑 Auto-delete: {'ON 🟢' if del_on else 'OFF 🔴'}",
+        reply_markup=mode_keyboard(remote_path, del_on)
     )
 
 
@@ -1888,7 +1734,7 @@ async def on_rclone_conf_document(_, msg: Message):
 
 @app.on_callback_query(auth_filter)
 async def cb_mode(_, cq: CallbackQuery):
-    global delete_after_upload, max_size_enabled
+    global delete_after_upload
 
     if cq.data.startswith("deltoggle:"):
         parts = cq.data.split(":", 2)
@@ -1896,31 +1742,11 @@ async def cb_mode(_, cq: CallbackQuery):
         with state_lock:
             delete_after_upload = (action == "delon")
             del_on = delete_after_upload
-            size_on = max_size_enabled
-            cap_mb = max_size_bytes // (1024 * 1024)
         del_text = "🗑 Auto-delete: ON 🟢" if del_on else "🗑 Auto-delete: OFF 🔴"
-        size_text = f"📏 Size cap: {'ON 🟢 (' + str(cap_mb) + ' MB)' if size_on else 'OFF 🔴'}"
         await cq.answer(del_text)
         await cq.message.edit(
-            f"📂 **Choose upload mode for:**\n`{remote_path}`\n{del_text}\n{size_text}",
-            reply_markup=mode_keyboard(remote_path, del_on, size_on)
-        )
-        return
-
-    if cq.data.startswith("sizetoggle:"):
-        parts = cq.data.split(":", 2)
-        _, action, remote_path = parts
-        with state_lock:
-            max_size_enabled = (action == "sizeon")
-            size_on = max_size_enabled
-            cap_mb = max_size_bytes // (1024 * 1024)
-            del_on = delete_after_upload
-        del_text = "🗑 Auto-delete: ON 🟢" if del_on else "🗑 Auto-delete: OFF 🔴"
-        size_text = f"📏 Size cap: {'ON 🟢 (' + str(cap_mb) + ' MB)' if size_on else 'OFF 🔴'}"
-        await cq.answer(size_text)
-        await cq.message.edit(
-            f"📂 **Choose upload mode for:**\n`{remote_path}`\n{del_text}\n{size_text}",
-            reply_markup=mode_keyboard(remote_path, del_on, size_on)
+            f"📂 **Choose upload mode for:**\n`{remote_path}`\n{del_text}",
+            reply_markup=mode_keyboard(remote_path, del_on)
         )
         return
 
@@ -1938,12 +1764,9 @@ async def cb_mode(_, cq: CallbackQuery):
         return
     with state_lock:
         do_delete = delete_after_upload
-        size_cap_on = max_size_enabled
-        cap_mb = max_size_bytes // (1024 * 1024)
     del_note = " · 🗑 Delete ON" if do_delete else ""
-    size_note = f" · 📏 Cap {cap_mb}MB" if size_cap_on else ""
 
-    await cq.message.edit(f"📂 `{remote_path}`\n{mode_icon} mode{del_note}{size_note}\n\n🔍 Listing files…")
+    await cq.message.edit(f"📂 `{remote_path}`\n{mode_icon} mode{del_note}\n\n🔍 Listing files…")
 
     try:
         files = await asyncio.get_running_loop().run_in_executor(
@@ -1958,14 +1781,8 @@ async def cb_mode(_, cq: CallbackQuery):
         await cq.message.edit("❌ No files found at that path.")
         return
 
-    size_map: dict[str, int] | None = None
-    if size_cap_on:
-        size_map = await asyncio.get_running_loop().run_in_executor(
-            None, rclone_size_map, remote_path)
-
     status_msg = cq.message
-    results = await _run_job(status_msg, files, remote_path, mode, user_id, do_delete,
-                             size_map=size_map)
+    results = await _run_job(status_msg, files, remote_path, mode, user_id, do_delete)
     await _send_summary(status_msg, results)
 
 # ── Entry point ───────────────────────────────────────────────
